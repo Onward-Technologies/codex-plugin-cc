@@ -32,11 +32,39 @@ function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
+// SessionStart runs on every start, resume and compaction with the same
+// CLAUDE_ENV_FILE. An append adds the same exports each time, and on Windows the
+// Bash tool fails near the 8,191-character command-line limit (upstream issues
+// 528, 661, 664, 778, 783, 788, 810, 819, 824, 827, 830). So the export for a
+// name replaces any earlier export of that name, and the file is written whole
+// (a temp file in the same folder, then a rename, which replaces the target).
 function appendEnvVar(name, value) {
-  if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
+  const envFile = process.env.CLAUDE_ENV_FILE;
+  if (!envFile || value == null || value === "") {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+  const prefix = `export ${name}=`;
+  let kept = [];
+  try {
+    kept = fs
+      .readFileSync(envFile, "utf8")
+      .split("\n")
+      .filter((line) => line !== "" && !line.startsWith(prefix));
+  } catch {
+    kept = [];
+  }
+  kept.push(`${prefix}${shellEscape(value)}`);
+  const tmp = `${envFile}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, `${kept.join("\n")}\n`, "utf8");
+    fs.renameSync(tmp, envFile);
+  } finally {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // Best effort: the temp file is gone after a successful rename.
+    }
+  }
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
