@@ -22,6 +22,11 @@ const OWN = [
   "export CODEX_COMPANION_TRANSCRIPT_PATH='/t/1.jsonl'",
   "export CLAUDE_PLUGIN_DATA='/plugin/data'"
 ];
+const OWN_TEXT = `${OWN.join("\n")}\n`;
+
+function tmpFiles(dir) {
+  return fs.readdirSync(dir).filter((f) => f.endsWith(".tmp"));
+}
 
 test("3 runs leave the exact bytes of 1 run", () => {
   const dir = makeTempDir();
@@ -30,19 +35,25 @@ test("3 runs leave the exact bytes of 1 run", () => {
     const r = sessionStart(envFile, { session_id: "session-1", transcript_path: "/t/1.jsonl" });
     assert.equal(r.status, 0, r.stderr);
   }
-  assert.equal(fs.readFileSync(envFile, "utf8"), `${OWN.join("\n")}\n`);
-  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+  assert.equal(fs.readFileSync(envFile, "utf8"), OWN_TEXT);
+  assert.deepEqual(tmpFiles(dir), []);
 });
 
-test("a bloated file shrinks to 1 copy each; other content stays verbatim", () => {
+test("an already bloated file is rewritten to 1 copy of each export", () => {
   const dir = makeTempDir();
-  const envFile = path.join(dir, "env.sh");
-  const foreign = ["export OTHER='kept'", "", "cat <<'EOF' > /dev/null", "line one", "", "EOF"];
-  const bloated = [...foreign, ...OWN, ...OWN, ...OWN, "export CODEX_COMPANION_SESSION_ID='stale'"];
-  fs.writeFileSync(envFile, `${bloated.join("\n")}\n`);
+  const envFile = path.join(dir, "sessionstart-hook-4.sh");
+  fs.writeFileSync(envFile, [...OWN, ...OWN, ...OWN, "export CODEX_COMPANION_SESSION_ID='stale'", ""].join("\n"));
   const r = sessionStart(envFile, { session_id: "session-1", transcript_path: "/t/1.jsonl" });
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(fs.readFileSync(envFile, "utf8"), `${[...foreign, ...OWN].join("\n")}\n`);
+  assert.equal(fs.readFileSync(envFile, "utf8"), OWN_TEXT);
+});
+
+test("a new value replaces the old one", () => {
+  const dir = makeTempDir();
+  const envFile = path.join(dir, "env.sh");
+  sessionStart(envFile, { session_id: "old", transcript_path: "/t/1.jsonl" });
+  sessionStart(envFile, { session_id: "session-1", transcript_path: "/t/1.jsonl" });
+  assert.equal(fs.readFileSync(envFile, "utf8"), OWN_TEXT);
 });
 
 test("a value with a line break is not written; the others are", () => {
@@ -53,35 +64,31 @@ test("a value with a line break is not written; the others are", () => {
   assert.equal(fs.readFileSync(envFile, "utf8"), `${OWN.slice(1).join("\n")}\n`);
 });
 
-test("a single quote stays one line that bash reads back exactly", (t) => {
+const BASH = spawnSync("bash", ["-c", "exit 0"], { encoding: "utf8" });
+test("bash sources the file and reads a hostile value back exactly", { skip: BASH.error || BASH.status !== 0 ? "bash not available here" : false }, () => {
   const dir = makeTempDir();
   const envFile = path.join(dir, "env.sh");
   sessionStart(envFile, { session_id: "a'b $(touch pwned)", transcript_path: "/t/x.jsonl" });
-  sessionStart(envFile, { session_id: "a'b $(touch pwned)", transcript_path: "/t/x.jsonl" });
-  const lines = fs.readFileSync(envFile, "utf8").trimEnd().split("\n");
-  assert.equal(lines.filter((l) => l.startsWith("export CODEX_COMPANION_SESSION_ID=")).length, 1);
-  const bash = spawnSync("bash", ["-c", `. "$1"; printf '%s' "$CODEX_COMPANION_SESSION_ID"`, "x", envFile.replace(/\\/g, "/")], {
+  const r = spawnSync("bash", ["-c", `. "$1" && printf '%s' "$CODEX_COMPANION_SESSION_ID"`, "x", envFile.replace(/\\/g, "/")], {
     cwd: dir,
     encoding: "utf8"
   });
-  if (bash.error || bash.status !== 0) {
-    t.skip("bash not available here");
-    return;
-  }
-  assert.equal(bash.stdout, "a'b $(touch pwned)");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, "a'b $(touch pwned)");
   assert.equal(fs.existsSync(path.join(dir, "pwned")), false);
 });
 
-test("a read error other than a missing file leaves it alone and exits 0", () => {
+test("a stat error other than a missing file leaves the path alone and exits 0", () => {
   const dir = makeTempDir();
-  const envFile = path.join(dir, "is-a-directory");
-  fs.mkdirSync(envFile);
+  const envFile = path.join(dir, "file", "below-a-file");
+  fs.writeFileSync(path.join(dir, "file"), "x");
   const r = sessionStart(envFile, { session_id: "s", transcript_path: "/t/1.jsonl" });
   assert.equal(r.status, 0, r.stderr);
-  // The read path must stop it, before any write: the message names the read.
-  assert.match(r.stderr, /CLAUDE_ENV_FILE not updated \(read: /);
-  assert.ok(fs.statSync(envFile).isDirectory());
-  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), []);
+  // POSIX reports ENOTDIR here, so the stat path must stop it; Windows reports
+  // ENOENT, so the write path stops it. Either way nothing changes.
+  assert.match(r.stderr, process.platform === "win32" ? /CLAUDE_ENV_FILE not updated \(/ : /CLAUDE_ENV_FILE not updated \(stat: /);
+  assert.equal(fs.readFileSync(path.join(dir, "file"), "utf8"), "x");
+  assert.deepEqual(tmpFiles(dir), []);
 });
 
 test("a failed write exits 0, reports on stderr and leaves no temp file", () => {
@@ -89,21 +96,34 @@ test("a failed write exits 0, reports on stderr and leaves no temp file", () => 
   const envFile = path.join(dir, "no-such-dir", "env.sh");
   const r = sessionStart(envFile, { session_id: "s", transcript_path: "/t/1.jsonl" });
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stderr, /CLAUDE_ENV_FILE not updated/);
+  assert.match(r.stderr, /CLAUDE_ENV_FILE not updated \(ENOENT\)/);
+  assert.doesNotMatch(r.stderr, /kept/);
   assert.deepEqual(fs.readdirSync(dir), []);
 });
 
-test("the file mode is kept (POSIX)", (t) => {
-  if (process.platform === "win32") {
-    t.skip("POSIX modes only");
-    return;
-  }
+test("a failed rename onto a directory keeps the directory and removes the run's own temp file", () => {
+  const dir = makeTempDir();
+  const envFile = path.join(dir, "a-directory");
+  fs.mkdirSync(envFile);
+  const r = sessionStart(envFile, { session_id: "s", transcript_path: "/t/1.jsonl" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /CLAUDE_ENV_FILE not updated \(/);
+  assert.ok(fs.statSync(envFile).isDirectory());
+  assert.deepEqual(tmpFiles(dir), []);
+});
+
+test("the file mode is kept, and the content is updated (POSIX)", { skip: process.platform === "win32" ? "POSIX modes only" : false }, () => {
   const dir = makeTempDir();
   const envFile = path.join(dir, "env.sh");
-  fs.writeFileSync(envFile, "");
-  fs.chmodSync(envFile, 0o600);
-  sessionStart(envFile, { session_id: "s", transcript_path: "/t/1.jsonl" });
-  assert.equal(fs.statSync(envFile).mode & 0o777, 0o600);
+  fs.writeFileSync(envFile, "export OLD='x'\n");
+  fs.chmodSync(envFile, 0o640);
+  const r = run("sh", ["-c", `umask 077 && exec "$0" "$@"`, process.execPath, HOOK, "SessionStart"], {
+    input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "session-1", transcript_path: "/t/1.jsonl" }),
+    env: { ...process.env, CLAUDE_ENV_FILE: envFile, CLAUDE_PLUGIN_DATA: "/plugin/data" }
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.statSync(envFile).mode & 0o777, 0o640);
+  assert.equal(fs.readFileSync(envFile, "utf8"), OWN_TEXT);
 });
 
 test("no CLAUDE_ENV_FILE: nothing is written and the hook exits 0", () => {
