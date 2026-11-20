@@ -33,36 +33,58 @@ function shellEscape(value) {
 }
 
 // SessionStart runs on every start, resume and compaction with the same
-// CLAUDE_ENV_FILE. An append adds the same exports each time, and on Windows the
-// Bash tool fails near the 8,191-character command-line limit (upstream issues
-// 528, 661, 664, 778, 783, 788, 810, 819, 824, 827, 830). So the export for a
-// name replaces any earlier export of that name, and the file is written whole
-// (a temp file in the same folder, then a rename, which replaces the target).
-function appendEnvVar(name, value) {
+// CLAUDE_ENV_FILE. The old code appended its exports each time, so the file grew,
+// and on Windows the Bash tool fails near the 8,191-character command-line limit
+// (a reported symptom; upstream issues 528, 661, 664, 778, 783, 788, 810, 819,
+// 824, 827, 830). Now all exports are written in ONE update:
+//  - a missing file counts as empty; any other read error leaves the file alone;
+//  - every line that is not one of this hook's own exports stays exactly as it
+//    was (blank lines and multi-line shell content included);
+//  - this hook's own exports are recognized only in the exact one-line form it
+//    writes, and a value with a line break is never written, so they stay one line;
+//  - the file is replaced by a rename from a temp file in the same folder, with
+//    the old file's mode kept (0600 for a new file);
+//  - any failure is reported on stderr and never fails SessionStart.
+const EXPORT_LINE = (name) => new RegExp(`^export ${name}='(?:[^']|'"'"')*'$`);
+
+function writeEnvVars(entries) {
   const envFile = process.env.CLAUDE_ENV_FILE;
-  if (!envFile || value == null || value === "") {
+  if (!envFile) {
     return;
   }
-  const prefix = `export ${name}=`;
-  let kept = [];
-  try {
-    kept = fs
-      .readFileSync(envFile, "utf8")
-      .split("\n")
-      .filter((line) => line !== "" && !line.startsWith(prefix));
-  } catch {
-    kept = [];
+  const wanted = entries.filter(
+    ([, value]) => value != null && value !== "" && !/[\r\n]/.test(String(value))
+  );
+  if (wanted.length === 0) {
+    return;
   }
-  kept.push(`${prefix}${shellEscape(value)}`);
+  let text = "";
+  let mode = 0o600;
+  try {
+    text = fs.readFileSync(envFile, "utf8");
+    mode = fs.statSync(envFile).mode & 0o777;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      process.stderr.write(`codex: CLAUDE_ENV_FILE not updated (read: ${error?.code ?? "error"})\n`);
+      return;
+    }
+  }
+  const managed = wanted.map(([name]) => EXPORT_LINE(name));
+  const kept = text === "" ? [] : text.replace(/\n$/, "").split("\n");
+  const others = kept.filter((line) => !managed.some((re) => re.test(line)));
+  const lines = [...others, ...wanted.map(([name, value]) => `export ${name}=${shellEscape(value)}`)];
   const tmp = `${envFile}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(tmp, `${kept.join("\n")}\n`, "utf8");
+    fs.writeFileSync(tmp, `${lines.join("\n")}\n`, { encoding: "utf8", mode, flag: "wx" });
+    fs.chmodSync(tmp, mode);
     fs.renameSync(tmp, envFile);
+  } catch (error) {
+    process.stderr.write(`codex: CLAUDE_ENV_FILE not updated (${error?.code ?? "error"}); the previous file is kept\n`);
   } finally {
     try {
       fs.rmSync(tmp, { force: true });
     } catch {
-      // Best effort: the temp file is gone after a successful rename.
+      // Best effort: after a successful rename there is no temp file.
     }
   }
 }
@@ -103,9 +125,11 @@ function cleanupSessionJobs(cwd, sessionId) {
 }
 
 function handleSessionStart(input) {
-  appendEnvVar(SESSION_ID_ENV, input.session_id);
-  appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
-  appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  writeEnvVars([
+    [SESSION_ID_ENV, input.session_id],
+    [TRANSCRIPT_PATH_ENV, input.transcript_path],
+    [PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]]
+  ]);
 }
 
 async function handleSessionEnd(input) {
