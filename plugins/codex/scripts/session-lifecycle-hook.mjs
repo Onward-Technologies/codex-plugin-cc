@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import process from "node:process";
 
@@ -32,11 +33,65 @@ function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
-function appendEnvVar(name, value) {
-  if (!process.env.CLAUDE_ENV_FILE || value == null || value === "") {
+// SessionStart runs on every start, resume and compaction with the same
+// CLAUDE_ENV_FILE. The old code appended its exports each time, so the file grew,
+// and on Windows users report that the Bash tool then fails near the
+// 8,191-character command-line limit (upstream issues 528, 661, 664, 778, 783,
+// 788, 810, 819, 824, 827, 830).
+//
+// Claude Code gives each hook its own env file
+// (session-env/<session>/sessionstart-hook-<index>.sh), so this hook OWNS the
+// file: it writes the whole file with only its own exports, in one update, and
+// reads none of its content. The same idea as a fresh file per run.
+//  - The file is replaced by a rename from a temp file in the same folder that
+//    this run created; the old file's permission bits are kept (0600 for a new
+//    file). A stat error other than a missing file leaves the file alone.
+//  - A value with a line break is never written.
+//  - Any failure is reported on stderr and never fails SessionStart.
+function writeEnvVars(entries) {
+  const envFile = process.env.CLAUDE_ENV_FILE;
+  if (!envFile) {
     return;
   }
-  fs.appendFileSync(process.env.CLAUDE_ENV_FILE, `export ${name}=${shellEscape(value)}\n`, "utf8");
+  const lines = entries
+    .filter(([, value]) => value != null && value !== "" && !/[\r\n]/.test(String(value)))
+    .map(([name, value]) => `export ${name}=${shellEscape(value)}`);
+  if (lines.length === 0) {
+    return;
+  }
+  let mode = 0o600;
+  try {
+    mode = fs.statSync(envFile).mode & 0o777;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      process.stderr.write(`codex: CLAUDE_ENV_FILE not updated (stat: ${error?.code ?? "error"})\n`);
+      return;
+    }
+  }
+  const tmp = `${envFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let created = false;
+  try {
+    const fd = fs.openSync(tmp, "wx", mode);
+    created = true;
+    try {
+      fs.writeFileSync(fd, `${lines.join("\n")}\n`, "utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, envFile);
+    created = false;
+  } catch (error) {
+    process.stderr.write(`codex: CLAUDE_ENV_FILE not updated (${error?.code ?? "error"})\n`);
+  } finally {
+    if (created) {
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        // Best effort: only this run's own temp file is ever removed.
+      }
+    }
+  }
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
@@ -75,9 +130,11 @@ function cleanupSessionJobs(cwd, sessionId) {
 }
 
 function handleSessionStart(input) {
-  appendEnvVar(SESSION_ID_ENV, input.session_id);
-  appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
-  appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  writeEnvVars([
+    [SESSION_ID_ENV, input.session_id],
+    [TRANSCRIPT_PATH_ENV, input.transcript_path],
+    [PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]]
+  ]);
 }
 
 async function handleSessionEnd(input) {
